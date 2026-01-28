@@ -62,6 +62,15 @@ def health_dashboard_html() -> str:
 # =============================================================================
 
 
+def _format_number(num: int) -> str:
+    """Format a number with commas for thousands."""
+    if num >= 1_000_000:
+        return f"{num / 1_000_000:.1f}M"
+    if num >= 1_000:
+        return f"{num / 1_000:.1f}K"
+    return str(num)
+
+
 @mcp.tool(
     description=(
         "Display an interactive network health dashboard showing overall metrics, "
@@ -82,7 +91,8 @@ def show_network_dashboard(
     """Show the network health dashboard with current data.
 
     This tool is visible to both LLM and UI.
-    Returns a text summary for the LLM and JSON data for the UI.
+    Returns a text summary for the LLM conversation.
+    The UI calls refresh_dashboard_data to get full JSON data.
     """
     # Validate hours
     hours = max(1, min(168, hours))
@@ -97,58 +107,62 @@ def show_network_dashboard(
     # Fetch all dashboard data
     health_overview = get_health_overview(filters)
     top_talkers = get_top_talkers(filters)
-    traffic_timeline = get_traffic_timeline(filters)
 
-    # Build dashboard data for UI
-    dashboard_data = {
-        "healthOverview": asdict(health_overview),
-        "topTalkers": [asdict(t) for t in top_talkers],
-        "trafficTimeline": [asdict(t) for t in traffic_timeline],
-        "filters": {
-            "hours": hours,
-            "sensor_ip": sensor_ip,
-            "sensor_name": sensor_name,
-        },
-        "generatedAt": datetime.now(timezone.utc).isoformat(),
-    }
+    # Build text summary for LLM conversation
+    time_range = f"last {hours} hour{'s' if hours != 1 else ''}"
 
-    # Convert application metrics to camelCase for UI compatibility
-    dashboard_data["healthOverview"]["applications"] = [
-        {
-            "applicationName": app["application_name"],
-            "totalTransactions": app["total_transactions"],
-            "errorCount": app["error_count"],
-            "avgLatencyMs": app["avg_latency_ms"],
-            "p95LatencyMs": app["p95_latency_ms"],
-        }
-        for app in dashboard_data["healthOverview"]["applications"]
+    # Calculate total errors for error count display
+    total_errors = sum(app.error_count for app in health_overview.applications)
+
+    lines = [
+        f"Network Health Dashboard ({time_range})",
+        "",
+        "Overview:",
+        f"- Total Transactions: {_format_number(health_overview.total_transactions)}",
+        f"- Error Rate: {health_overview.error_rate:.2f}% ({_format_number(total_errors)} errors)",
+        f"- Avg Latency: {health_overview.avg_latency_ms:.1f}ms (P95: {health_overview.p95_latency_ms:.1f}ms)",
+        f"- Unique Clients: {health_overview.unique_clients} | Servers: {health_overview.unique_servers}",
+        "",
     ]
 
-    # Convert top talkers to camelCase
-    dashboard_data["topTalkers"] = [
-        {
-            "clientIp": t["client_ip"],
-            "serverIp": t["server_ip"],
-            "bytes": t["bytes"],
-            "requestCount": t["request_count"],
-        }
-        for t in dashboard_data["topTalkers"]
-    ]
+    # Top applications by transaction volume
+    if health_overview.applications:
+        lines.append("Top Applications:")
+        for i, app in enumerate(health_overview.applications[:5], 1):
+            error_pct = (
+                (app.error_count / app.total_transactions * 100)
+                if app.total_transactions > 0
+                else 0
+            )
+            lines.append(
+                f"{i}. {app.application_name} - "
+                f"{_format_number(app.total_transactions)} transactions, "
+                f"{error_pct:.1f}% errors"
+            )
+        lines.append("")
 
-    # Convert health overview keys to camelCase
-    ho = dashboard_data["healthOverview"]
-    dashboard_data["healthOverview"] = {
-        "totalTransactions": ho["total_transactions"],
-        "errorRate": ho["error_rate"],
-        "avgLatencyMs": ho["avg_latency_ms"],
-        "p95LatencyMs": ho["p95_latency_ms"],
-        "uniqueClients": ho["unique_clients"],
-        "uniqueServers": ho["unique_servers"],
-        "applications": ho["applications"],
-    }
+    # Top talkers summary
+    if top_talkers:
+        lines.append("Top Talkers (by traffic):")
+        for i, talker in enumerate(top_talkers[:3], 1):
+            bytes_str = _format_bytes(talker.bytes)
+            lines.append(f"{i}. {talker.client_ip} → {talker.server_ip}: {bytes_str}")
+        lines.append("")
 
-    # Return JSON data - both UI and LLM can parse it
-    return json.dumps(dashboard_data)
+    lines.append("The interactive dashboard is displayed above with traffic trends and detailed breakdowns.")
+
+    return "\n".join(lines)
+
+
+def _format_bytes(num_bytes: int) -> str:
+    """Format bytes into human-readable string."""
+    if num_bytes >= 1_000_000_000:
+        return f"{num_bytes / 1_000_000_000:.1f} GB"
+    if num_bytes >= 1_000_000:
+        return f"{num_bytes / 1_000_000:.1f} MB"
+    if num_bytes >= 1_000:
+        return f"{num_bytes / 1_000:.1f} KB"
+    return f"{num_bytes} B"
 
 
 @mcp.tool(

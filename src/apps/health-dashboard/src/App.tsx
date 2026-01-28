@@ -15,7 +15,7 @@ import {
   Grid,
   BadgeDelta,
   AreaChart,
-  BarList,
+  DonutChart,
   Table,
   TableHead,
   TableRow,
@@ -195,6 +195,36 @@ export default function App() {
       }
     }
   }, [isConnected, app]);
+
+  // Fetch initial data when connected
+  // Since show_network_dashboard now returns text summary, UI must call refresh_dashboard_data
+  useEffect(() => {
+    if (isConnected && app && !data) {
+      const fetchInitialData = async () => {
+        try {
+          const result = await app.callServerTool({
+            name: "refresh_dashboard_data",
+            arguments: { hours },
+          });
+
+          const content = result.content as ToolContent[] | undefined;
+          if (Array.isArray(content) && content.length > 0) {
+            const jsonData = JSON.parse(content[0].text);
+            setData(jsonData);
+            setLastUpdated(jsonData.generatedAt);
+            setError(null);
+          }
+        } catch (e) {
+          console.error("Failed to fetch initial data:", e);
+          setError("Failed to load dashboard data");
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      fetchInitialData();
+    }
+  }, [isConnected, app, data, hours]);
 
   // Refresh data function
   const refreshData = useCallback(async () => {
@@ -385,7 +415,15 @@ export default function App() {
         <Card>
           <Title>Application Breakdown</Title>
           <Text className="mb-4">Transactions by application</Text>
-          <BarList data={applicationBarData} className="mt-2" />
+          <DonutChart
+            data={applicationBarData}
+            category="value"
+            index="name"
+            className="h-48"
+            colors={["blue", "cyan", "indigo", "violet", "fuchsia"]}
+            showLabel
+            valueFormatter={formatNumber}
+          />
         </Card>
 
         {/* Top Talkers */}
