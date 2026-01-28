@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+#
+# omnis-ctl - Control script for Omnis Dashboard MCP Server
+#
+# Usage: omnis-ctl <command>
+#
+# Commands:
+#   start       Start the MCP server (background)
+#   stop        Stop the MCP server
+#   restart     Restart the MCP server
+#   status      Show server status
+#   logs        Show server logs (follow mode)
+#   test        Test the MCP endpoint
+#
+
+set -euo pipefail
+
+# Configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PID_FILE="${SCRIPT_DIR}/.omnis-dashboard.pid"
+LOG_FILE="${SCRIPT_DIR}/omnis-dashboard.log"
+
+# Colors
+if [[ -t 1 ]]; then
+    GREEN='\033[38;5;40m'
+    RED='\033[38;5;196m'
+    YELLOW='\033[38;5;220m'
+    BLUE='\033[38;5;33m'
+    RESET='\033[0m'
+else
+    GREEN=''
+    RED=''
+    YELLOW=''
+    BLUE=''
+    RESET=''
+fi
+
+print_success() { printf "  ${GREEN}✓${RESET} %s\n" "$1"; }
+print_error() { printf "  ${RED}✗${RESET} %s\n" "$1"; }
+print_warning() { printf "  ${YELLOW}⚠${RESET} %s\n" "$1"; }
+print_info() { printf "  ${BLUE}ℹ${RESET} %s\n" "$1"; }
+
+get_port() {
+    grep -oP 'PORT=\K\d+' "${SCRIPT_DIR}/.env" 2>/dev/null || echo "8002"
+}
+
+is_running() {
+    if [[ -f "$PID_FILE" ]]; then
+        local pid
+        pid=$(cat "$PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+cmd_start() {
+    if is_running; then
+        print_warning "Server already running (PID: $(cat "$PID_FILE"))"
+        return 0
+    fi
+
+    print_info "Starting omnis-dashboard..."
+
+    cd "$SCRIPT_DIR"
+    nohup uv run python -m omnis_dashboard >> "$LOG_FILE" 2>&1 &
+    local pid=$!
+    echo "$pid" > "$PID_FILE"
+
+    sleep 2
+
+    if is_running; then
+        print_success "Server started (PID: $pid)"
+        print_info "Logs: $LOG_FILE"
+        print_info "Endpoint: http://0.0.0.0:$(get_port)/mcp"
+    else
+        print_error "Server failed to start"
+        print_info "Check logs: tail -50 $LOG_FILE"
+        rm -f "$PID_FILE"
+        exit 1
+    fi
+}
+
+cmd_stop() {
+    if ! is_running; then
+        print_warning "Server not running"
+        rm -f "$PID_FILE"
+        return 0
+    fi
+
+    local pid
+    pid=$(cat "$PID_FILE")
+    print_info "Stopping omnis-dashboard (PID: $pid)..."
+
+    kill "$pid" 2>/dev/null || true
+    sleep 1
+
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+
+    rm -f "$PID_FILE"
+    print_success "Server stopped"
+}
+
+cmd_restart() {
+    cmd_stop
+    sleep 1
+    cmd_start
+}
+
+cmd_status() {
+    echo ""
+    printf "  ${BLUE}Omnis Dashboard Status${RESET}\n"
+    echo ""
+
+    # Service status
+    if is_running; then
+        local pid
+        pid=$(cat "$PID_FILE")
+        printf "  Status:        ${GREEN}running${RESET} (PID: %s)\n" "$pid"
+    else
+        printf "  Status:        ${RED}stopped${RESET}\n"
+    fi
+
+    # Port
+    local port
+    port=$(get_port)
+    printf "  Port:          %s\n" "$port"
+
+    # Endpoint check (use POST for MCP streamable HTTP)
+    if curl -sf -X POST "http://127.0.0.1:${port}/mcp" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json, text/event-stream" \
+        -d '{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"omnis-ctl","version":"1.0"}}}' \
+        --max-time 2 2>/dev/null | grep -q "serverInfo"; then
+        printf "  Endpoint:      ${GREEN}responding${RESET}\n"
+    else
+        printf "  Endpoint:      ${YELLOW}not responding${RESET}\n"
+    fi
+
+    # Log file
+    if [[ -f "$LOG_FILE" ]]; then
+        local log_size
+        log_size=$(du -h "$LOG_FILE" | cut -f1)
+        printf "  Log file:      %s (%s)\n" "$LOG_FILE" "$log_size"
+    fi
+
+    echo ""
+}
+
+cmd_logs() {
+    if [[ ! -f "$LOG_FILE" ]]; then
+        print_warning "No log file found"
+        return 0
+    fi
+
+    print_info "Showing logs (Ctrl+C to exit)..."
+    echo ""
+    tail -f "$LOG_FILE"
+}
+
+cmd_test() {
+    local port
+    port=$(get_port)
+    local endpoint="http://127.0.0.1:${port}/mcp"
+
+    echo ""
+    print_info "Testing MCP endpoint at ${endpoint}"
+    echo ""
+
+    # Test initialize (MCP streamable HTTP requires POST with JSON-RPC)
+    print_info "Testing initialize..."
+    local headers_and_body
+    headers_and_body=$(curl -s -D - -X POST "$endpoint" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json, text/event-stream" \
+        -d '{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"omnis-ctl","version":"1.0"}}}' \
+        --max-time 5 2>/dev/null) || true
+
+    if echo "$headers_and_body" | grep -q "serverInfo" 2>/dev/null; then
+        print_success "Server initialized"
+
+        # Extract server info
+        local server_info
+        server_info=$(echo "$headers_and_body" | python3 -c "
+import sys, json
+for line in sys.stdin:
+    if line.startswith('data: '):
+        try:
+            data = json.loads(line[6:])
+            info = data.get('result', {}).get('serverInfo', {})
+            print(f\"{info.get('name', 'unknown')} v{info.get('version', '?')}\")
+            break
+        except:
+            pass
+" 2>/dev/null)
+        print_info "Server: $server_info"
+
+        # Extract session ID for tools/list
+        local session_id
+        session_id=$(echo "$headers_and_body" | grep -i "mcp-session-id:" | sed 's/.*: //' | tr -d '\r')
+
+        if [[ -n "$session_id" ]]; then
+            # Test tools/list with session
+            print_info "Testing tools/list..."
+            local response
+            response=$(curl -s -X POST "$endpoint" \
+                -H "Content-Type: application/json" \
+                -H "Accept: application/json, text/event-stream" \
+                -H "Mcp-Session-Id: $session_id" \
+                -d '{"jsonrpc":"2.0","method":"tools/list","id":2}' \
+                --max-time 10 2>/dev/null) || true
+
+            if echo "$response" | grep -q "tools" 2>/dev/null; then
+                print_success "Tools discovery working"
+                echo ""
+                print_info "Available tools:"
+                echo "$response" | python3 -c "
+import sys, json
+for line in sys.stdin:
+    if line.startswith('data: '):
+        try:
+            data = json.loads(line[6:])
+            tools = data.get('result', {}).get('tools', [])
+            for tool in tools:
+                print(f\"    - {tool.get('name', 'unknown')}\")
+            break
+        except:
+            pass
+" 2>/dev/null || echo "    (unable to parse response)"
+            else
+                print_warning "Tools discovery returned unexpected response"
+            fi
+        fi
+    else
+        print_error "Initialize failed"
+        exit 1
+    fi
+
+    echo ""
+}
+
+show_help() {
+    cat << 'EOF'
+omnis-ctl - Control script for Omnis Dashboard MCP Server
+
+Usage: omnis-ctl <command>
+
+Commands:
+  start       Start the MCP server (background)
+  stop        Stop the MCP server
+  restart     Restart the MCP server
+  status      Show server status
+  logs        Show server logs (follow mode)
+  test        Test the MCP endpoint
+  help        Show this help message
+
+Examples:
+  ./omnis-ctl start       # Start the server
+  ./omnis-ctl status      # Show server status
+  ./omnis-ctl logs        # Follow log output
+  ./omnis-ctl test        # Test the MCP endpoint
+
+EOF
+}
+
+main() {
+    local command="${1:-help}"
+
+    case "$command" in
+        start)
+            cmd_start
+            ;;
+        stop)
+            cmd_stop
+            ;;
+        restart)
+            cmd_restart
+            ;;
+        status)
+            cmd_status
+            ;;
+        logs)
+            cmd_logs
+            ;;
+        test)
+            cmd_test
+            ;;
+        help|-h|--help)
+            show_help
+            ;;
+        *)
+            print_error "Unknown command: $command"
+            echo ""
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

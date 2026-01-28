@@ -32,3 +32,12 @@ coverage/
 
 # Vite
 .vite/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+*.egg-info/
+.omnis-dashboard.pid
+omnis-dashboard.log
