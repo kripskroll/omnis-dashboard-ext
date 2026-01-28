@@ -16,6 +16,7 @@ from fastmcp import FastMCP
 
 from omnis_dashboard.data.clickhouse import (
     QueryFilters,
+    get_application_details,
     get_health_overview,
     get_top_talkers,
     get_traffic_timeline,
@@ -240,3 +241,92 @@ def refresh_dashboard_data(
     }
 
     return json.dumps(dashboard_data)
+
+
+@mcp.tool(
+    description="Get detailed metrics for a specific application (internal use only)",
+    meta={
+        "title": "Application Details",
+        "ui": {
+            "resourceUri": HEALTH_DASHBOARD_RESOURCE_URI,
+            "visibility": ["app"],  # Hidden from LLM, only callable by UI
+        },
+        "ui/resourceUri": HEALTH_DASHBOARD_RESOURCE_URI,
+    },
+)
+def get_application_details_tool(
+    application_name: Annotated[str, "Application name to get details for"],
+    hours: Annotated[int, "Time range in hours (1-168, default: 24)"] = 24,
+    sensor_ip: Annotated[str | None, "Filter by sensor IP address"] = None,
+    sensor_name: Annotated[str | None, "Filter by sensor name"] = None,
+) -> str:
+    """Get detailed metrics for a specific application.
+
+    This tool is hidden from the LLM and only callable by the dashboard UI.
+    Returns JSON data with overview, top clients, top servers, and timeline.
+    """
+    # Validate hours
+    hours = max(1, min(168, hours))
+
+    filters = QueryFilters(
+        hours=hours,
+        sensor_ip=sensor_ip,
+        sensor_name=sensor_name,
+        limit=10,
+    )
+
+    # Fetch application details
+    overview, top_clients, top_servers, timeline = get_application_details(
+        filters, application_name
+    )
+
+    # Build response data
+    response_data = {
+        "overview": {
+            "applicationName": overview.application_name,
+            "totalTransactions": overview.total_transactions,
+            "errorCount": overview.error_count,
+            "errorRate": overview.error_rate,
+            "avgLatencyMs": overview.avg_latency_ms,
+            "p50LatencyMs": overview.p50_latency_ms,
+            "p95LatencyMs": overview.p95_latency_ms,
+            "p99LatencyMs": overview.p99_latency_ms,
+            "totalBytes": overview.total_bytes,
+            "uniqueClients": overview.unique_clients,
+            "uniqueServers": overview.unique_servers,
+        },
+        "topClients": [
+            {
+                "clientIp": c.client_ip,
+                "transactions": c.transactions,
+                "errors": c.errors,
+                "bytes": c.bytes,
+            }
+            for c in top_clients
+        ],
+        "topServers": [
+            {
+                "serverIp": s.server_ip,
+                "serverPort": s.server_port,
+                "transactions": s.transactions,
+                "avgLatencyMs": s.avg_latency_ms,
+            }
+            for s in top_servers
+        ],
+        "timeline": [
+            {
+                "hour": t.hour,
+                "requests": t.requests,
+                "errors": t.errors,
+            }
+            for t in timeline
+        ],
+        "filters": {
+            "hours": hours,
+            "sensor_ip": sensor_ip,
+            "sensor_name": sensor_name,
+        },
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+    }
+
+    return json.dumps(response_data)

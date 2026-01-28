@@ -79,6 +79,35 @@ interface ToolContent {
   text: string;
 }
 
+interface ApplicationDetails {
+  overview: {
+    applicationName: string;
+    totalTransactions: number;
+    errorCount: number;
+    errorRate: number;
+    avgLatencyMs: number;
+    p50LatencyMs: number;
+    p95LatencyMs: number;
+    p99LatencyMs: number;
+    totalBytes: number;
+    uniqueClients: number;
+    uniqueServers: number;
+  };
+  topClients: Array<{
+    clientIp: string;
+    transactions: number;
+    errors: number;
+    bytes: number;
+  }>;
+  topServers: Array<{
+    serverIp: string;
+    serverPort: number;
+    transactions: number;
+    avgLatencyMs: number;
+  }>;
+  timeline: TrafficTimelinePoint[];
+}
+
 // =============================================================================
 // Utility Functions
 // =============================================================================
@@ -122,6 +151,11 @@ export default function App() {
   const [hours, setHours] = useState(24);
   const [autoRefresh, setAutoRefresh] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<string | null>(null);
+
+  // Application drilldown state
+  const [selectedApp, setSelectedApp] = useState<string | null>(null);
+  const [appDetails, setAppDetails] = useState<ApplicationDetails | null>(null);
+  const [loadingDetails, setLoadingDetails] = useState(false);
 
   // Store app reference for calling tools
   const appRef = useRef<McpApp | null>(null);
@@ -292,6 +326,39 @@ export default function App() {
     }
   };
 
+  // Handle application click for drilldown
+  const handleAppClick = async (appName: string | undefined) => {
+    const currentApp = appRef.current;
+    if (!appName || !currentApp) return;
+
+    setSelectedApp(appName);
+    setLoadingDetails(true);
+    setAppDetails(null);
+
+    try {
+      const result = await currentApp.callServerTool({
+        name: "get_application_details_tool",
+        arguments: { application_name: appName, hours },
+      });
+
+      const content = result.content as ToolContent[] | undefined;
+      if (Array.isArray(content) && content.length > 0) {
+        const jsonData = JSON.parse(content[0].text);
+        setAppDetails(jsonData);
+      }
+    } catch (e) {
+      console.error("Failed to fetch application details:", e);
+    } finally {
+      setLoadingDetails(false);
+    }
+  };
+
+  // Handle back button from detail view
+  const handleBackToOverview = () => {
+    setSelectedApp(null);
+    setAppDetails(null);
+  };
+
   // Loading state
   if (loading && !data) {
     return <LoadingSkeleton />;
@@ -331,6 +398,19 @@ export default function App() {
     Requests: point.requests,
     Errors: point.errors,
   }));
+
+  // Render application detail view if an app is selected
+  if (selectedApp) {
+    return (
+      <ApplicationDetailView
+        appName={selectedApp}
+        details={appDetails}
+        loading={loadingDetails}
+        hours={hours}
+        onBack={handleBackToOverview}
+      />
+    );
+  }
 
   return (
     <div className="p-4 md:p-6 min-h-screen bg-tremor-background dark:bg-dark-tremor-background">
@@ -419,11 +499,15 @@ export default function App() {
             data={applicationBarData}
             category="value"
             index="name"
-            className="h-48"
+            className="h-48 cursor-pointer"
             colors={["blue", "cyan", "indigo", "violet", "fuchsia"]}
             showLabel
             valueFormatter={formatNumber}
+            onValueChange={(v) => handleAppClick(v?.name)}
           />
+          <Text className="text-center text-xs text-tremor-content dark:text-dark-tremor-content mt-2">
+            Click an application for details
+          </Text>
         </Card>
 
         {/* Top Talkers */}
@@ -502,6 +586,204 @@ function LoadingSkeleton() {
 
       <Card>
         <div className="h-72 bg-tremor-background-subtle dark:bg-dark-tremor-background-subtle rounded animate-pulse" />
+      </Card>
+    </div>
+  );
+}
+
+// =============================================================================
+// Application Detail View Component
+// =============================================================================
+
+interface ApplicationDetailViewProps {
+  appName: string;
+  details: ApplicationDetails | null;
+  loading: boolean;
+  hours: number;
+  onBack: () => void;
+}
+
+function ApplicationDetailView({ appName, details, loading, hours, onBack }: ApplicationDetailViewProps) {
+  // Loading state
+  if (loading || !details) {
+    return (
+      <div className="p-4 md:p-6 min-h-screen bg-tremor-background dark:bg-dark-tremor-background">
+        <Flex className="mb-6" alignItems="center">
+          <button
+            onClick={onBack}
+            className="mr-4 text-tremor-content hover:text-tremor-content-emphasis dark:text-dark-tremor-content dark:hover:text-dark-tremor-content-emphasis"
+          >
+            ← Back
+          </button>
+          <Title>{appName} Details</Title>
+        </Flex>
+
+        <Grid numItemsSm={2} numItemsLg={4} className="gap-4 mb-6">
+          {[...Array(4)].map((_, i) => (
+            <Card key={i}>
+              <div className="h-4 w-24 bg-tremor-background-subtle dark:bg-dark-tremor-background-subtle rounded animate-pulse" />
+              <div className="h-10 w-32 mt-2 bg-tremor-background-subtle dark:bg-dark-tremor-background-subtle rounded animate-pulse" />
+            </Card>
+          ))}
+        </Grid>
+
+        <Grid numItemsMd={2} className="gap-4 mb-6">
+          {[...Array(2)].map((_, i) => (
+            <Card key={i}>
+              <div className="h-48 bg-tremor-background-subtle dark:bg-dark-tremor-background-subtle rounded animate-pulse" />
+            </Card>
+          ))}
+        </Grid>
+
+        <Card>
+          <div className="h-72 bg-tremor-background-subtle dark:bg-dark-tremor-background-subtle rounded animate-pulse" />
+        </Card>
+      </div>
+    );
+  }
+
+  const { overview, topClients, topServers, timeline } = details;
+
+  // Prepare timeline data for chart
+  const timelineData = timeline.map((point) => ({
+    hour: new Date(point.hour).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+    Requests: point.requests,
+    Errors: point.errors,
+  }));
+
+  return (
+    <div className="p-4 md:p-6 min-h-screen bg-tremor-background dark:bg-dark-tremor-background">
+      {/* Header with Back Button */}
+      <Flex className="mb-6" justifyContent="between" alignItems="center">
+        <Flex alignItems="center">
+          <button
+            onClick={onBack}
+            className="mr-4 px-3 py-1 rounded text-tremor-content hover:text-tremor-content-emphasis hover:bg-tremor-background-subtle dark:text-dark-tremor-content dark:hover:text-dark-tremor-content-emphasis dark:hover:bg-dark-tremor-background-subtle transition-colors"
+          >
+            ← Back
+          </button>
+          <div>
+            <Title>{overview.applicationName} Details</Title>
+            <Text className="text-tremor-content dark:text-dark-tremor-content">
+              Last {hours} hour{hours !== 1 ? "s" : ""}
+            </Text>
+          </div>
+        </Flex>
+      </Flex>
+
+      {/* Metrics Cards */}
+      <Grid numItemsSm={2} numItemsLg={4} className="gap-4 mb-6">
+        <Card decoration="top" decorationColor="blue">
+          <Text>Transactions</Text>
+          <Metric>{formatNumber(overview.totalTransactions)}</Metric>
+          <Flex className="mt-2">
+            <Text className="text-sm text-tremor-content dark:text-dark-tremor-content">
+              P95: {overview.p95LatencyMs.toFixed(1)}ms
+            </Text>
+          </Flex>
+        </Card>
+
+        <Card decoration="top" decorationColor={getErrorRateColor(overview.errorRate)}>
+          <Text>Error Rate</Text>
+          <Metric>{overview.errorRate.toFixed(2)}%</Metric>
+          <Flex className="mt-2">
+            <Text className="text-sm text-tremor-content dark:text-dark-tremor-content">
+              {formatNumber(overview.errorCount)} errors
+            </Text>
+          </Flex>
+        </Card>
+
+        <Card decoration="top" decorationColor="blue">
+          <Text>Avg Latency</Text>
+          <Metric>{overview.avgLatencyMs.toFixed(1)} ms</Metric>
+          <Flex className="mt-2">
+            <Text className="text-sm text-tremor-content dark:text-dark-tremor-content">
+              P99: {overview.p99LatencyMs.toFixed(1)}ms
+            </Text>
+          </Flex>
+        </Card>
+
+        <Card decoration="top" decorationColor="blue">
+          <Text>Traffic</Text>
+          <Metric>{formatBytes(overview.totalBytes)}</Metric>
+          <Flex className="mt-2">
+            <Text className="text-sm text-tremor-content dark:text-dark-tremor-content">
+              {formatNumber(overview.uniqueClients)} clients • {formatNumber(overview.uniqueServers)} servers
+            </Text>
+          </Flex>
+        </Card>
+      </Grid>
+
+      {/* Top Clients & Servers */}
+      <Grid numItemsMd={2} className="gap-4 mb-6">
+        {/* Top Clients */}
+        <Card>
+          <Title>Top Clients</Title>
+          <Text className="mb-4">Highest transaction count</Text>
+          <Table>
+            <TableHead>
+              <TableRow>
+                <TableHeaderCell>Client IP</TableHeaderCell>
+                <TableHeaderCell className="text-right">Transactions</TableHeaderCell>
+                <TableHeaderCell className="text-right">Errors</TableHeaderCell>
+                <TableHeaderCell className="text-right">Traffic</TableHeaderCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {topClients.map((client, idx) => (
+                <TableRow key={idx}>
+                  <TableCell className="font-mono text-sm">{client.clientIp}</TableCell>
+                  <TableCell className="text-right">{formatNumber(client.transactions)}</TableCell>
+                  <TableCell className="text-right">{formatNumber(client.errors)}</TableCell>
+                  <TableCell className="text-right">{formatBytes(client.bytes)}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Card>
+
+        {/* Top Servers */}
+        <Card>
+          <Title>Top Servers</Title>
+          <Text className="mb-4">Highest transaction count</Text>
+          <Table>
+            <TableHead>
+              <TableRow>
+                <TableHeaderCell>Server</TableHeaderCell>
+                <TableHeaderCell className="text-right">Transactions</TableHeaderCell>
+                <TableHeaderCell className="text-right">Avg Latency</TableHeaderCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {topServers.map((server, idx) => (
+                <TableRow key={idx}>
+                  <TableCell className="font-mono text-sm">
+                    {server.serverIp}:{server.serverPort}
+                  </TableCell>
+                  <TableCell className="text-right">{formatNumber(server.transactions)}</TableCell>
+                  <TableCell className="text-right">{server.avgLatencyMs.toFixed(1)} ms</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Card>
+      </Grid>
+
+      {/* Traffic Timeline */}
+      <Card>
+        <Title>Traffic Timeline</Title>
+        <Text className="mb-4">Requests and errors over time for {overview.applicationName}</Text>
+        <AreaChart
+          className="h-72 mt-4"
+          data={timelineData}
+          index="hour"
+          categories={["Requests", "Errors"]}
+          colors={["blue", "rose"]}
+          valueFormatter={(value) => formatNumber(value)}
+          showLegend
+          showGridLines
+          curveType="natural"
+        />
       </Card>
     </div>
   );

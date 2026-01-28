@@ -73,6 +73,43 @@ class TrafficTimelinePoint:
     errors: int
 
 
+@dataclass
+class ApplicationDetailData:
+    """Detailed metrics for a specific application."""
+
+    application_name: str
+    total_transactions: int
+    error_count: int
+    error_rate: float
+    avg_latency_ms: float
+    p50_latency_ms: float
+    p95_latency_ms: float
+    p99_latency_ms: float
+    total_bytes: int
+    unique_clients: int
+    unique_servers: int
+
+
+@dataclass
+class TopClientData:
+    """Top client for an application."""
+
+    client_ip: str
+    transactions: int
+    errors: int
+    bytes: int
+
+
+@dataclass
+class TopServerData:
+    """Top server for an application."""
+
+    server_ip: str
+    server_port: int
+    transactions: int
+    avg_latency_ms: float
+
+
 # =============================================================================
 # Client Management
 # =============================================================================
@@ -295,3 +332,156 @@ def get_traffic_timeline(filters: QueryFilters) -> list[TrafficTimelinePoint]:
     except Exception as e:
         print(f"[clickhouse] get_traffic_timeline error: {e}")
         return []
+
+
+def get_application_details(
+    filters: QueryFilters, application_name: str
+) -> tuple[ApplicationDetailData, list[TopClientData], list[TopServerData], list[TrafficTimelinePoint]]:
+    """Get detailed metrics for a specific application.
+
+    Returns:
+        Tuple of (overview, top_clients, top_servers, timeline)
+    """
+    where_clause, params = _build_where_clause(filters)
+    params["app_name"] = application_name
+
+    # Add application filter to where clause
+    app_where = f"{where_clause} AND application_name = {{app_name:String}}"
+
+    # Overall metrics for this application
+    overview_query = f"""
+        SELECT
+            sum(agt_successful_transactions_count + agt_failed_transactions_count) as total_transactions,
+            sum(agt_failed_transactions_count) as error_count,
+            sum(agt_total_response_time) / nullIf(sum(agt_successful_transactions_count + agt_failed_transactions_count), 0) / 1000 as avg_latency_ms,
+            quantile(0.50)(agt_peak_response_time_usec / 1000) as p50_latency_ms,
+            quantile(0.95)(agt_peak_response_time_usec / 1000) as p95_latency_ms,
+            quantile(0.99)(agt_peak_response_time_usec / 1000) as p99_latency_ms,
+            sum(agt_to_server_octets_count + agt_from_server_octets_count) as total_bytes,
+            uniq(client_host_ip_address) as unique_clients,
+            uniq(server_host_ip_address) as unique_servers
+        FROM f_aggregate_telemetry
+        {app_where}
+    """
+
+    # Top clients
+    params["client_limit"] = filters.limit
+    clients_query = f"""
+        SELECT
+            client_host_ip_address as client_ip,
+            sum(agt_successful_transactions_count + agt_failed_transactions_count) as transactions,
+            sum(agt_failed_transactions_count) as errors,
+            sum(agt_to_server_octets_count + agt_from_server_octets_count) as bytes
+        FROM f_aggregate_telemetry
+        {app_where}
+        GROUP BY client_host_ip_address
+        ORDER BY transactions DESC
+        LIMIT {{client_limit:UInt32}}
+    """
+
+    # Top servers
+    params["server_limit"] = filters.limit
+    servers_query = f"""
+        SELECT
+            server_host_ip_address as server_ip,
+            server_port,
+            sum(agt_successful_transactions_count + agt_failed_transactions_count) as transactions,
+            sum(agt_total_response_time) / nullIf(sum(agt_successful_transactions_count + agt_failed_transactions_count), 0) / 1000 as avg_latency_ms
+        FROM f_aggregate_telemetry
+        {app_where}
+        GROUP BY server_host_ip_address, server_port
+        ORDER BY transactions DESC
+        LIMIT {{server_limit:UInt32}}
+    """
+
+    # Traffic timeline for this application
+    timeline_query = f"""
+        SELECT
+            toStartOfHour(cal_timestamp_time) as hour,
+            sum(agt_successful_transactions_count + agt_failed_transactions_count) as requests,
+            sum(agt_failed_transactions_count) as errors
+        FROM f_aggregate_telemetry
+        {app_where}
+        GROUP BY hour
+        ORDER BY hour
+    """
+
+    try:
+        overview_results = ClickHouseClient.query(overview_query, params)
+        clients_results = ClickHouseClient.query(clients_query, params)
+        servers_results = ClickHouseClient.query(servers_query, params)
+        timeline_results = ClickHouseClient.query(timeline_query, params)
+
+        # Parse overview
+        overview = overview_results[0] if overview_results else {}
+        total_transactions = int(overview.get("total_transactions", 0))
+        error_count = int(overview.get("error_count", 0))
+
+        overview_data = ApplicationDetailData(
+            application_name=application_name,
+            total_transactions=total_transactions,
+            error_count=error_count,
+            error_rate=(error_count / total_transactions * 100) if total_transactions > 0 else 0,
+            avg_latency_ms=float(overview.get("avg_latency_ms", 0) or 0),
+            p50_latency_ms=float(overview.get("p50_latency_ms", 0) or 0),
+            p95_latency_ms=float(overview.get("p95_latency_ms", 0) or 0),
+            p99_latency_ms=float(overview.get("p99_latency_ms", 0) or 0),
+            total_bytes=int(overview.get("total_bytes", 0)),
+            unique_clients=int(overview.get("unique_clients", 0)),
+            unique_servers=int(overview.get("unique_servers", 0)),
+        )
+
+        # Parse top clients
+        top_clients = [
+            TopClientData(
+                client_ip=str(row.get("client_ip", "")),
+                transactions=int(row.get("transactions", 0)),
+                errors=int(row.get("errors", 0)),
+                bytes=int(row.get("bytes", 0)),
+            )
+            for row in clients_results
+        ]
+
+        # Parse top servers
+        top_servers = [
+            TopServerData(
+                server_ip=str(row.get("server_ip", "")),
+                server_port=int(row.get("server_port", 0)),
+                transactions=int(row.get("transactions", 0)),
+                avg_latency_ms=float(row.get("avg_latency_ms", 0) or 0),
+            )
+            for row in servers_results
+        ]
+
+        # Parse timeline
+        timeline = [
+            TrafficTimelinePoint(
+                hour=str(row.get("hour", "")),
+                requests=int(row.get("requests", 0)),
+                errors=int(row.get("errors", 0)),
+            )
+            for row in timeline_results
+        ]
+
+        return overview_data, top_clients, top_servers, timeline
+
+    except Exception as e:
+        print(f"[clickhouse] get_application_details error: {e}")
+        return (
+            ApplicationDetailData(
+                application_name=application_name,
+                total_transactions=0,
+                error_count=0,
+                error_rate=0,
+                avg_latency_ms=0,
+                p50_latency_ms=0,
+                p95_latency_ms=0,
+                p99_latency_ms=0,
+                total_bytes=0,
+                unique_clients=0,
+                unique_servers=0,
+            ),
+            [],
+            [],
+            [],
+        )
