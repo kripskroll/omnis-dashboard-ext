@@ -80,7 +80,10 @@ def _format_number(num: int) -> str:
     ),
     meta={
         "title": "Network Health Dashboard",
-        "ui": {"resourceUri": HEALTH_DASHBOARD_RESOURCE_URI},
+        "ui": {
+            "resourceUri": HEALTH_DASHBOARD_RESOURCE_URI,
+            "mcpui.dev/ui-preferred-frame-size": ["100%", "1200px"],
+        },
         "ui/resourceUri": HEALTH_DASHBOARD_RESOURCE_URI,  # Legacy key for compatibility
     },
 )
